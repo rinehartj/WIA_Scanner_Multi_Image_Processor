@@ -315,7 +315,7 @@ def detect_and_crop_documents(image_path):
 def main():
     """Main function to run the scanning process."""
     print("=" * 50)
-    print("Epson Perfection 3200 Photo Scanner")
+    print("WIA Scanner with Auto-Crop")
     print("=" * 50)
     print()
 
