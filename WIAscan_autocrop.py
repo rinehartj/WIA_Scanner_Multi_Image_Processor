@@ -20,6 +20,179 @@ WIA_INTENT_IMAGE_TYPE_GRAYSCALE = 0x00000002
 WIA_INTENT_IMAGE_TYPE_TEXT = 0x00000004
 
 
+class CornerAdjustmentWindow:
+    """Fullscreen window for adjusting corner points"""
+
+    def __init__(self, parent, image, corners, callback):
+        self.parent = parent
+        self.original_image = image.copy()
+        self.corners = corners.copy()
+        self.callback = callback
+        self.selected_corner = None
+        self.dragging = False
+
+        # Create fullscreen window
+        self.window = tk.Toplevel(parent)
+        self.window.title("Adjust Corner Points")
+        self.window.attributes('-fullscreen', True)
+        self.window.configure(bg='black')
+
+        # Create canvas
+        self.canvas = tk.Canvas(self.window, bg='black', highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Bind events
+        self.canvas.bind('<Button-1>', self.on_mouse_down)
+        self.canvas.bind('<B1-Motion>', self.on_mouse_drag)
+        self.canvas.bind('<ButtonRelease-1>', self.on_mouse_up)
+        self.window.bind('<Escape>', lambda e: self.cancel())
+        self.window.bind('<Return>', lambda e: self.apply())
+
+        # Instructions frame
+        self.create_instructions()
+
+        # Wait for window to be drawn
+        self.window.update()
+
+        # Display image
+        self.display_image()
+
+    def create_instructions(self):
+        """Create instruction panel"""
+        frame = tk.Frame(self.window, bg='black')
+        frame.place(relx=0.5, rely=0.95, anchor='center')
+
+        instructions = "Drag corner points to adjust • ENTER to apply • ESC to cancel"
+        label = tk.Label(frame, text=instructions, bg='black', fg='white',
+                         font=('Arial', 14, 'bold'))
+        label.pack(pady=10)
+
+        btn_frame = tk.Frame(frame, bg='black')
+        btn_frame.pack()
+
+        apply_btn = tk.Button(btn_frame, text="Apply", command=self.apply,
+                              bg='green', fg='white', font=('Arial', 12, 'bold'),
+                              padx=20, pady=10)
+        apply_btn.pack(side=tk.LEFT, padx=10)
+
+        cancel_btn = tk.Button(btn_frame, text="Cancel", command=self.cancel,
+                               bg='red', fg='white', font=('Arial', 12, 'bold'),
+                               padx=20, pady=10)
+        cancel_btn.pack(side=tk.LEFT, padx=10)
+
+    def display_image(self):
+        """Display image with corner points"""
+        # Get canvas size
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        # Create image with corners drawn
+        display_img = self.original_image.copy()
+
+        # Scale corners to display coordinates
+        img_h, img_w = self.original_image.shape[:2]
+        scale = min(canvas_width / img_w, canvas_height / img_h)
+
+        # Ensure we don't scale up
+        if scale > 1.0:
+            scale = 1.0
+
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+
+        # Store scale and offset for coordinate conversion
+        self.scale = scale
+        self.offset_x = (canvas_width - new_w) // 2
+        self.offset_y = (canvas_height - new_h) // 2
+
+        # Draw lines between corners
+        for i in range(4):
+            pt1 = tuple(self.corners[i].astype(int))
+            pt2 = tuple(self.corners[(i + 1) % 4].astype(int))
+            cv2.line(display_img, pt1, pt2, (0, 255, 0), 4)
+
+        # Draw corner points (larger and more visible)
+        for i, pt in enumerate(self.corners):
+            pt_int = tuple(pt.astype(int))
+            # Draw outer circle
+            cv2.circle(display_img, pt_int, 25, (0, 255, 0), -1)
+            # Draw inner circle
+            cv2.circle(display_img, pt_int, 20, (255, 255, 255), -1)
+            # Draw number
+            cv2.putText(display_img, str(i + 1), pt_int,
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 4)
+
+        # Resize image
+        display_img = cv2.resize(display_img, (new_w, new_h))
+
+        # Convert to RGB
+        display_img = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
+
+        # Convert to PhotoImage
+        img_pil = Image.fromarray(display_img)
+        self.photo = ImageTk.PhotoImage(img_pil)
+
+        # Display on canvas
+        self.canvas.delete("all")
+        self.canvas.create_image(self.offset_x, self.offset_y,
+                                 image=self.photo, anchor='nw')
+
+    def canvas_to_image_coords(self, canvas_x, canvas_y):
+        """Convert canvas coordinates to image coordinates"""
+        img_x = (canvas_x - self.offset_x) / self.scale
+        img_y = (canvas_y - self.offset_y) / self.scale
+        return img_x, img_y
+
+    def on_mouse_down(self, event):
+        """Handle mouse down event"""
+        img_x, img_y = self.canvas_to_image_coords(event.x, event.y)
+
+        # Find nearest corner
+        min_dist = float('inf')
+        closest_corner = None
+
+        for i, pt in enumerate(self.corners):
+            dist = np.sqrt((pt[0] - img_x) ** 2 + (pt[1] - img_y) ** 2)
+            if dist < min_dist:
+                min_dist = dist
+                closest_corner = i
+
+        # Select corner if close enough (50 pixels in image space)
+        if min_dist < 50:
+            self.selected_corner = closest_corner
+            self.dragging = True
+
+    def on_mouse_drag(self, event):
+        """Handle mouse drag event"""
+        if self.dragging and self.selected_corner is not None:
+            img_x, img_y = self.canvas_to_image_coords(event.x, event.y)
+
+            # Clamp to image bounds
+            img_h, img_w = self.original_image.shape[:2]
+            img_x = max(0, min(img_w - 1, img_x))
+            img_y = max(0, min(img_h - 1, img_y))
+
+            # Update corner position
+            self.corners[self.selected_corner] = [img_x, img_y]
+
+            # Redraw
+            self.display_image()
+
+    def on_mouse_up(self, event):
+        """Handle mouse up event"""
+        self.dragging = False
+        self.selected_corner = None
+
+    def apply(self):
+        """Apply changes and close window"""
+        self.callback(self.corners)
+        self.window.destroy()
+
+    def cancel(self):
+        """Cancel changes and close window"""
+        self.window.destroy()
+
+
 class ScannerGUI:
     def __init__(self, root):
         self.root = root
@@ -31,9 +204,6 @@ class ScannerGUI:
         self.tiff_filepath = None
         self.cropped_images = []
         self.current_preview_index = 0
-        self.corner_points = []
-        self.adjustment_mode = False
-        self.selected_corner = None
 
         # Load settings
         self.load_settings()
@@ -142,7 +312,6 @@ class ScannerGUI:
         # Canvas for image display
         self.canvas = tk.Canvas(preview_frame, bg='gray', width=800, height=300)
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.bind("<Button-1>", self.on_canvas_click)
 
         # Navigation and action buttons
         button_frame = ttk.Frame(main_frame)
@@ -158,7 +327,7 @@ class ScannerGUI:
         self.next_btn.pack(side=tk.LEFT, padx=5)
 
         self.adjust_btn = ttk.Button(button_frame, text="Adjust Corners",
-                                     command=self.toggle_adjustment_mode, state='disabled')
+                                     command=self.open_adjustment_window, state='disabled')
         self.adjust_btn.pack(side=tk.LEFT, padx=20)
 
         self.keep_btn = ttk.Button(button_frame, text="Keep All",
@@ -381,6 +550,9 @@ class ScannerGUI:
             box = cv2.boxPoints(rect)
             box = np.float32(box)
 
+            # Order the points properly
+            box = self.order_points(box)
+
             cropped_data.append({
                 'image': image.copy(),
                 'corners': box,
@@ -430,88 +602,27 @@ class ScannerGUI:
         self.canvas.delete("all")
         self.canvas.create_image(canvas_width // 2, canvas_height // 2, image=self.photo)
 
-        # Draw corner points if in adjustment mode
-        if self.adjustment_mode:
-            self.draw_corner_points()
-
         # Update label
         self.image_label.config(text=f"Image {self.current_preview_index + 1} of {len(self.cropped_images)}")
 
-    def draw_corner_points(self):
-        """Draw adjustable corner points on original image"""
+    def open_adjustment_window(self):
+        """Open fullscreen window for corner adjustment"""
         if not self.cropped_images:
             return
 
         data = self.cropped_images[self.current_preview_index]
-        image = data['image'].copy()
+        image = data['image']
         corners = data['corners']
 
-        # Draw corners on image
-        for i, pt in enumerate(corners):
-            cv2.circle(image, tuple(pt.astype(int)), 15, (0, 255, 0), -1)
-            cv2.putText(image, str(i + 1), tuple(pt.astype(int)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        # Open adjustment window
+        CornerAdjustmentWindow(self.root, image, corners, self.on_corners_adjusted)
 
-        # Draw lines between corners
-        for i in range(4):
-            pt1 = tuple(corners[i].astype(int))
-            pt2 = tuple(corners[(i + 1) % 4].astype(int))
-            cv2.line(image, pt1, pt2, (0, 255, 0), 3)
-
-        # Convert and display
-        display_img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        canvas_width = self.canvas.winfo_width()
-        canvas_height = self.canvas.winfo_height()
-        h, w = display_img.shape[:2]
-
-        scale = min(canvas_width / w, canvas_height / h, 1.0)
-        self.scale = scale
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-
-        display_img = cv2.resize(display_img, (new_w, new_h))
-        img_pil = Image.fromarray(display_img)
-        self.photo = ImageTk.PhotoImage(img_pil)
-
-        self.canvas.delete("all")
-        self.canvas.create_image(canvas_width // 2, canvas_height // 2, image=self.photo)
-
-    def on_canvas_click(self, event):
-        """Handle canvas click for corner adjustment"""
-        if not self.adjustment_mode or not self.cropped_images:
-            return
-
-        canvas_width = self.canvas.winfo_width()
-        canvas_height = self.canvas.winfo_height()
-
-        data = self.cropped_images[self.current_preview_index]
-        h, w = data['image'].shape[:2]
-
-        scale = min(canvas_width / w, canvas_height / h, 1.0)
-
-        # Convert canvas coordinates to image coordinates
-        offset_x = (canvas_width - w * scale) // 2
-        offset_y = (canvas_height - h * scale) // 2
-
-        img_x = (event.x - offset_x) / scale
-        img_y = (event.y - offset_y) / scale
-
-        # Find nearest corner
-        corners = data['corners']
-        min_dist = float('inf')
-        closest_corner = None
-
-        for i, pt in enumerate(corners):
-            dist = np.sqrt((pt[0] - img_x) ** 2 + (pt[1] - img_y) ** 2)
-            if dist < min_dist:
-                min_dist = dist
-                closest_corner = i
-
-        # Update corner position if close enough
-        if min_dist < 50 / scale:
-            corners[closest_corner] = [img_x, img_y]
-            self.draw_corner_points()
+    def on_corners_adjusted(self, new_corners):
+        """Callback when corners are adjusted"""
+        if self.cropped_images:
+            self.cropped_images[self.current_preview_index]['corners'] = new_corners
+            self.display_preview()
+            self.log(f"Corners adjusted for image {self.current_preview_index + 1}")
 
     def four_point_transform(self, image, pts):
         """Apply perspective transform"""
@@ -559,26 +670,12 @@ class ScannerGUI:
         """Show previous image"""
         if self.current_preview_index > 0:
             self.current_preview_index -= 1
-            self.adjustment_mode = False
-            self.adjust_btn.config(text="Adjust Corners")
             self.display_preview()
 
     def next_image(self):
         """Show next image"""
         if self.current_preview_index < len(self.cropped_images) - 1:
             self.current_preview_index += 1
-            self.adjustment_mode = False
-            self.adjust_btn.config(text="Adjust Corners")
-            self.display_preview()
-
-    def toggle_adjustment_mode(self):
-        """Toggle corner adjustment mode"""
-        self.adjustment_mode = not self.adjustment_mode
-        if self.adjustment_mode:
-            self.adjust_btn.config(text="Apply Adjustment")
-            self.draw_corner_points()
-        else:
-            self.adjust_btn.config(text="Adjust Corners")
             self.display_preview()
 
     def keep_images(self):
@@ -636,7 +733,6 @@ class ScannerGUI:
         """Reset preview state"""
         self.cropped_images = []
         self.current_preview_index = 0
-        self.adjustment_mode = False
         self.canvas.delete("all")
         self.image_label.config(text="No images")
         self.prev_btn.config(state='disabled')
