@@ -5,13 +5,15 @@ import os
 import cv2
 import numpy as np
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 from PIL import Image, ImageTk
 import json
 import threading
+import subprocess
 
 # Settings file for persistence
 SETTINGS_FILE = "scanner_settings.json"
+EXIFTOOL_PATH = "tools/exiftool.exe"
 
 # WIA Constants
 WIA_INTENT_NONE = 0x00000000
@@ -30,6 +32,8 @@ class CornerAdjustmentWindow:
         self.callback = callback
         self.selected_corner = None
         self.dragging = False
+        self.zoom_size = 150  # Size of zoom window
+        self.zoom_factor = 3  # Zoom magnification
 
         # Create fullscreen window
         self.window = tk.Toplevel(parent)
@@ -37,18 +41,33 @@ class CornerAdjustmentWindow:
         self.window.attributes('-fullscreen', True)
         self.window.configure(bg='black')
 
-        # Create canvas
-        self.canvas = tk.Canvas(self.window, bg='black', highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        # Get screen dimensions
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+
+        # Reserve space for controls at bottom
+        self.control_height = 120
+        self.canvas_height = screen_height - self.control_height
+
+        # Create canvas for main image
+        self.canvas = tk.Canvas(self.window, bg='black', highlightthickness=0,
+                                height=self.canvas_height)
+        self.canvas.pack(fill=tk.BOTH, expand=False)
+
+        # Create zoom canvas (initially hidden)
+        self.zoom_canvas = tk.Canvas(self.window, bg='black', highlightthickness=2,
+                                     highlightbackground='yellow',
+                                     width=self.zoom_size, height=self.zoom_size)
 
         # Bind events
         self.canvas.bind('<Button-1>', self.on_mouse_down)
         self.canvas.bind('<B1-Motion>', self.on_mouse_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_mouse_up)
+        self.canvas.bind('<Motion>', self.on_mouse_move)
         self.window.bind('<Escape>', lambda e: self.cancel())
         self.window.bind('<Return>', lambda e: self.apply())
 
-        # Instructions frame
+        # Instructions frame at bottom
         self.create_instructions()
 
         # Wait for window to be drawn
@@ -58,9 +77,10 @@ class CornerAdjustmentWindow:
         self.display_image()
 
     def create_instructions(self):
-        """Create instruction panel"""
-        frame = tk.Frame(self.window, bg='black')
-        frame.place(relx=0.5, rely=0.95, anchor='center')
+        """Create instruction panel at bottom"""
+        frame = tk.Frame(self.window, bg='black', height=self.control_height)
+        frame.pack(side=tk.BOTTOM, fill=tk.X)
+        frame.pack_propagate(False)
 
         instructions = "Drag corner points to adjust • ENTER to apply • ESC to cancel"
         label = tk.Label(frame, text=instructions, bg='black', fg='white',
@@ -84,7 +104,7 @@ class CornerAdjustmentWindow:
         """Display image with corner points"""
         # Get canvas size
         canvas_width = self.canvas.winfo_width()
-        canvas_height = self.canvas.winfo_height()
+        canvas_height = self.canvas_height
 
         # Create image with corners drawn
         display_img = self.original_image.copy()
@@ -111,16 +131,16 @@ class CornerAdjustmentWindow:
             pt2 = tuple(self.corners[(i + 1) % 4].astype(int))
             cv2.line(display_img, pt1, pt2, (0, 255, 0), 4)
 
-        # Draw corner points (larger and more visible)
+        # Draw corner points (larger and more visible - doubled size)
         for i, pt in enumerate(self.corners):
             pt_int = tuple(pt.astype(int))
-            # Draw outer circle
-            cv2.circle(display_img, pt_int, 25, (0, 255, 0), -1)
-            # Draw inner circle
-            cv2.circle(display_img, pt_int, 20, (255, 255, 255), -1)
+            # Draw outer circle (doubled from 25 to 50)
+            cv2.circle(display_img, pt_int, 50, (0, 255, 0), -1)
+            # Draw inner circle (doubled from 20 to 40)
+            cv2.circle(display_img, pt_int, 40, (255, 255, 255), -1)
             # Draw number
             cv2.putText(display_img, str(i + 1), pt_int,
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 4)
+                        cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 0, 0), 6)
 
         # Resize image
         display_img = cv2.resize(display_img, (new_w, new_h))
@@ -137,11 +157,76 @@ class CornerAdjustmentWindow:
         self.canvas.create_image(self.offset_x, self.offset_y,
                                  image=self.photo, anchor='nw')
 
+    def show_zoom(self, canvas_x, canvas_y):
+        """Show zoomed-in view around cursor"""
+        img_x, img_y = self.canvas_to_image_coords(canvas_x, canvas_y)
+
+        # Get region around cursor
+        img_h, img_w = self.original_image.shape[:2]
+        half_size = self.zoom_size // (2 * self.zoom_factor)
+
+        x1 = max(0, int(img_x - half_size))
+        y1 = max(0, int(img_y - half_size))
+        x2 = min(img_w, int(img_x + half_size))
+        y2 = min(img_h, int(img_y + half_size))
+
+        if x2 - x1 > 0 and y2 - y1 > 0:
+            # Extract region
+            region = self.original_image[y1:y2, x1:x2].copy()
+
+            # Draw crosshair at center
+            center_x = int(img_x - x1)
+            center_y = int(img_y - y1)
+            cv2.drawMarker(region, (center_x, center_y), (255, 0, 0),
+                           cv2.MARKER_CROSS, 20, 2)
+
+            # Zoom the region
+            zoom_h = (y2 - y1) * self.zoom_factor
+            zoom_w = (x2 - x1) * self.zoom_factor
+            zoomed = cv2.resize(region, (zoom_w, zoom_h), interpolation=cv2.INTER_NEAREST)
+
+            # Crop to fit zoom window
+            crop_h = min(self.zoom_size, zoom_h)
+            crop_w = min(self.zoom_size, zoom_w)
+            start_h = (zoom_h - crop_h) // 2
+            start_w = (zoom_w - crop_w) // 2
+            zoomed = zoomed[start_h:start_h + crop_h, start_w:start_w + crop_w]
+
+            # Convert to RGB
+            zoomed = cv2.cvtColor(zoomed, cv2.COLOR_BGR2RGB)
+            img_pil = Image.fromarray(zoomed)
+            self.zoom_photo = ImageTk.PhotoImage(img_pil)
+
+            # Position zoom window near cursor but not blocking it
+            zoom_x = canvas_x + 30
+            zoom_y = canvas_y + 30
+
+            # Keep zoom window on screen
+            canvas_width = self.canvas.winfo_width()
+            if zoom_x + self.zoom_size > canvas_width:
+                zoom_x = canvas_x - self.zoom_size - 30
+            if zoom_y + self.zoom_size > self.canvas_height:
+                zoom_y = canvas_y - self.zoom_size - 30
+
+            # Place zoom canvas
+            self.zoom_canvas.place(x=zoom_x, y=zoom_y)
+            self.zoom_canvas.delete("all")
+            self.zoom_canvas.create_image(0, 0, image=self.zoom_photo, anchor='nw')
+
+    def hide_zoom(self):
+        """Hide zoom window"""
+        self.zoom_canvas.place_forget()
+
     def canvas_to_image_coords(self, canvas_x, canvas_y):
         """Convert canvas coordinates to image coordinates"""
         img_x = (canvas_x - self.offset_x) / self.scale
         img_y = (canvas_y - self.offset_y) / self.scale
         return img_x, img_y
+
+    def on_mouse_move(self, event):
+        """Handle mouse movement"""
+        if self.dragging:
+            self.show_zoom(event.x, event.y)
 
     def on_mouse_down(self, event):
         """Handle mouse down event"""
@@ -157,10 +242,11 @@ class CornerAdjustmentWindow:
                 min_dist = dist
                 closest_corner = i
 
-        # Select corner if close enough (50 pixels in image space)
-        if min_dist < 50:
+        # Select corner if close enough (100 pixels in image space - doubled from 50)
+        if min_dist < 100:
             self.selected_corner = closest_corner
             self.dragging = True
+            self.show_zoom(event.x, event.y)
 
     def on_mouse_drag(self, event):
         """Handle mouse drag event"""
@@ -177,11 +263,13 @@ class CornerAdjustmentWindow:
 
             # Redraw
             self.display_image()
+            self.show_zoom(event.x, event.y)
 
     def on_mouse_up(self, event):
         """Handle mouse up event"""
         self.dragging = False
         self.selected_corner = None
+        self.hide_zoom()
 
     def apply(self):
         """Apply changes and close window"""
@@ -197,13 +285,14 @@ class ScannerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Document Scanner Controller")
-        self.root.geometry("900x700")
+        self.root.geometry("1200x750")
 
         # Scanner variables
         self.scanner = None
         self.tiff_filepath = None
         self.cropped_images = []
         self.current_preview_index = 0
+        self.full_scan_image = None  # Store full scan for manual add
 
         # Load settings
         self.load_settings()
@@ -220,7 +309,9 @@ class ScannerGUI:
             "crop_pixels": 5,
             "save_tiff": True,
             "document_name": "Document",
-            "output_folder": "Scans"
+            "output_folder": "Scans",
+            "exif_date": "",
+            "exif_title": ""
         }
 
         try:
@@ -248,9 +339,18 @@ class ScannerGUI:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
+        # Configure grid weights for responsive layout
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=2)
+        main_frame.rowconfigure(2, weight=1)
+
+        # Left column container
+        left_frame = ttk.Frame(main_frame)
+        left_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
+
         # Settings Frame
-        settings_frame = ttk.LabelFrame(main_frame, text="Scan Settings", padding="10")
-        settings_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        settings_frame = ttk.LabelFrame(left_frame, text="Scan Settings", padding="10")
+        settings_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
 
         # DPI
         ttk.Label(settings_frame, text="DPI:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
@@ -260,60 +360,90 @@ class ScannerGUI:
         dpi_spin.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
 
         # Scan Distance
-        ttk.Label(settings_frame, text="Scan Distance (inches):").grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(settings_frame, text="Scan Distance (inches):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
         self.distance_var = tk.DoubleVar(value=self.settings.get("scan_distance", 3.0))
         distance_spin = ttk.Spinbox(settings_frame, from_=1.0, to=12.0, increment=0.5,
                                     textvariable=self.distance_var, width=10)
-        distance_spin.grid(row=0, column=3, sticky=tk.W, padx=5, pady=5)
+        distance_spin.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
 
         # JPG Quality
-        ttk.Label(settings_frame, text="JPG Quality (%):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(settings_frame, text="JPG Quality (%):").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
         self.jpg_quality_var = tk.IntVar(value=self.settings.get("jpg_quality", 98))
         jpg_spin = ttk.Spinbox(settings_frame, from_=50, to=100, increment=1,
                                textvariable=self.jpg_quality_var, width=10)
-        jpg_spin.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        jpg_spin.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
 
         # Crop Pixels
-        ttk.Label(settings_frame, text="Crop Pixels:").grid(row=1, column=2, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(settings_frame, text="Crop Pixels:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
         self.crop_pixels_var = tk.IntVar(value=self.settings.get("crop_pixels", 5))
         crop_spin = ttk.Spinbox(settings_frame, from_=0, to=50, increment=1,
                                 textvariable=self.crop_pixels_var, width=10)
-        crop_spin.grid(row=1, column=3, sticky=tk.W, padx=5, pady=5)
+        crop_spin.grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
 
         # Save TIFF checkbox
         self.save_tiff_var = tk.BooleanVar(value=self.settings.get("save_tiff", True))
         tiff_check = ttk.Checkbutton(settings_frame, text="Save TIFF file",
                                      variable=self.save_tiff_var)
-        tiff_check.grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+        tiff_check.grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
 
         # Document Name
-        ttk.Label(settings_frame, text="Document Name:").grid(row=2, column=2, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(settings_frame, text="Document Name:").grid(row=5, column=0, sticky=tk.W, padx=5, pady=5)
         self.doc_name_var = tk.StringVar(value=self.settings.get("document_name", "Document"))
-        doc_entry = ttk.Entry(settings_frame, textvariable=self.doc_name_var, width=15)
-        doc_entry.grid(row=2, column=3, sticky=tk.W, padx=5, pady=5)
+        doc_entry = ttk.Entry(settings_frame, textvariable=self.doc_name_var, width=20)
+        doc_entry.grid(row=5, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+
+        # Output Folder
+        ttk.Label(settings_frame, text="Output Folder:").grid(row=6, column=0, sticky=tk.W, padx=5, pady=5)
+        folder_subframe = ttk.Frame(settings_frame)
+        folder_subframe.grid(row=6, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+
+        self.folder_var = tk.StringVar(value=self.settings.get("output_folder", "Scans"))
+        folder_entry = ttk.Entry(folder_subframe, textvariable=self.folder_var, width=20)
+        folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        browse_btn = ttk.Button(folder_subframe, text="...", command=self.browse_folder, width=3)
+        browse_btn.pack(side=tk.LEFT, padx=(5, 0))
+
+        # EXIF Settings Frame
+        exif_frame = ttk.LabelFrame(left_frame, text="EXIF Metadata (Optional)", padding="10")
+        exif_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+
+        # EXIF Date
+        ttk.Label(exif_frame, text="Date (YYYY:MM:DD):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.exif_date_var = tk.StringVar(value=self.settings.get("exif_date", ""))
+        exif_date_entry = ttk.Entry(exif_frame, textvariable=self.exif_date_var, width=20)
+        exif_date_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+
+        ttk.Label(exif_frame, text="(Leave blank for no date)",
+                  font=('Arial', 8, 'italic')).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=5)
+
+        # EXIF Title
+        ttk.Label(exif_frame, text="Title:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        self.exif_title_var = tk.StringVar(value=self.settings.get("exif_title", ""))
+        exif_title_entry = ttk.Entry(exif_frame, textvariable=self.exif_title_var, width=20)
+        exif_title_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
 
         # Scan Button
-        scan_btn = ttk.Button(main_frame, text="Scan", command=self.start_scan, width=20)
-        scan_btn.grid(row=1, column=0, columnspan=2, pady=10)
+        scan_btn = ttk.Button(left_frame, text="Scan", command=self.start_scan, width=20)
+        scan_btn.grid(row=2, column=0, pady=10)
 
         # Progress/Log Frame
-        log_frame = ttk.LabelFrame(main_frame, text="Status", padding="10")
-        log_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        main_frame.rowconfigure(2, weight=1)
+        log_frame = ttk.LabelFrame(left_frame, text="Status", padding="10")
+        log_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        left_frame.rowconfigure(3, weight=1)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, width=80, state='disabled')
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, width=50, state='disabled')
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-        # Preview Frame
+        # Preview Frame (right side)
         preview_frame = ttk.LabelFrame(main_frame, text="Preview", padding="10")
-        preview_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        main_frame.rowconfigure(3, weight=2)
+        preview_frame.grid(row=0, column=1, rowspan=4, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
 
         # Canvas for image display
-        self.canvas = tk.Canvas(preview_frame, bg='gray', width=800, height=300)
+        self.canvas = tk.Canvas(preview_frame, bg='gray', width=600, height=500)
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        # Navigation and action buttons
+        # Navigation and action buttons at bottom
         button_frame = ttk.Frame(main_frame)
         button_frame.grid(row=4, column=0, columnspan=2, pady=10)
 
@@ -326,9 +456,26 @@ class ScannerGUI:
         self.next_btn = ttk.Button(button_frame, text="Next →", command=self.next_image, state='disabled')
         self.next_btn.pack(side=tk.LEFT, padx=5)
 
+        # Rotation buttons
+        self.rotate_ccw_btn = ttk.Button(button_frame, text="↶ Rotate CCW",
+                                         command=self.rotate_ccw, state='disabled')
+        self.rotate_ccw_btn.pack(side=tk.LEFT, padx=5)
+
+        self.rotate_cw_btn = ttk.Button(button_frame, text="↷ Rotate CW",
+                                        command=self.rotate_cw, state='disabled')
+        self.rotate_cw_btn.pack(side=tk.LEFT, padx=5)
+
         self.adjust_btn = ttk.Button(button_frame, text="Adjust Corners",
                                      command=self.open_adjustment_window, state='disabled')
         self.adjust_btn.pack(side=tk.LEFT, padx=20)
+
+        self.add_btn = ttk.Button(button_frame, text="Add Image",
+                                  command=self.add_manual_image, state='disabled')
+        self.add_btn.pack(side=tk.LEFT, padx=5)
+
+        self.remove_btn = ttk.Button(button_frame, text="Remove Image",
+                                     command=self.remove_current_image, state='disabled')
+        self.remove_btn.pack(side=tk.LEFT, padx=5)
 
         self.keep_btn = ttk.Button(button_frame, text="Keep All",
                                    command=self.keep_images, state='disabled')
@@ -337,6 +484,15 @@ class ScannerGUI:
         self.rescan_btn = ttk.Button(button_frame, text="Rescan",
                                      command=self.rescan, state='disabled')
         self.rescan_btn.pack(side=tk.LEFT, padx=5)
+
+    def browse_folder(self):
+        """Browse for output folder"""
+        folder = filedialog.askdirectory(initialdir=self.folder_var.get(),
+                                         title="Select Output Folder")
+        if folder:
+            self.folder_var.set(folder)
+            self.settings["output_folder"] = folder
+            self.save_settings()
 
     def log(self, message):
         """Add message to log"""
@@ -355,6 +511,9 @@ class ScannerGUI:
         self.settings["crop_pixels"] = self.crop_pixels_var.get()
         self.settings["save_tiff"] = self.save_tiff_var.get()
         self.settings["document_name"] = self.doc_name_var.get()
+        self.settings["output_folder"] = self.folder_var.get()
+        self.settings["exif_date"] = self.exif_date_var.get()
+        self.settings["exif_title"] = self.exif_title_var.get()
         self.save_settings()
 
         # Clear log and preview
@@ -401,13 +560,14 @@ class ScannerGUI:
                     pythoncom.CoUninitialize()
                     return
             else:
-                # Save temporary TIFF for processing
+                # Save temporary TIFF for processing in script directory
                 self.log("Creating temporary file for processing...")
-                temp_folder = self.settings.get("output_folder", "Scans")
-                if not os.path.exists(temp_folder):
-                    os.makedirs(temp_folder)
-                self.tiff_filepath = os.path.join(temp_folder, "temp_scan.tif")
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                self.tiff_filepath = os.path.join(script_dir, "temp_scan.tif")
                 image.SaveFile(self.tiff_filepath)
+
+            # Store full scan image for manual add
+            self.full_scan_image = cv2.imread(self.tiff_filepath)
 
             # Detect and crop documents
             self.log("Detecting documents...")
@@ -419,7 +579,8 @@ class ScannerGUI:
                 self.root.after(0, self.display_preview)
                 self.root.after(0, self.enable_preview_controls)
             else:
-                self.log("No documents detected")
+                self.log("No documents detected - use 'Add Image' to manually add")
+                self.root.after(0, self.enable_preview_controls)
 
             # Delete temp TIFF if not saving
             if not self.save_tiff_var.get() and os.path.exists(self.tiff_filepath):
@@ -561,6 +722,102 @@ class ScannerGUI:
 
         return cropped_data
 
+    def rotate_cw(self):
+        """Rotate current image 90 degrees clockwise"""
+        if not self.cropped_images:
+            return
+
+        data = self.cropped_images[self.current_preview_index]
+
+        # Rotate image 90 degrees clockwise
+        data['image'] = cv2.rotate(data['image'], cv2.ROTATE_90_CLOCKWISE)
+
+        # Rotate corners
+        h, w = data['image'].shape[:2]
+        new_corners = np.zeros_like(data['corners'])
+        for i, (x, y) in enumerate(data['corners']):
+            # Transform: (x, y) -> (h - y, x) for 90° CW rotation
+            new_corners[i] = [h - y, x]
+
+        data['corners'] = new_corners
+        data['original_corners'] = new_corners.copy()
+
+        self.display_preview()
+        self.log(f"Rotated image {self.current_preview_index + 1} clockwise")
+
+    def rotate_ccw(self):
+        """Rotate current image 90 degrees counter-clockwise"""
+        if not self.cropped_images:
+            return
+
+        data = self.cropped_images[self.current_preview_index]
+
+        # Rotate image 90 degrees counter-clockwise
+        data['image'] = cv2.rotate(data['image'], cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        # Rotate corners
+        h, w = data['image'].shape[:2]
+        new_corners = np.zeros_like(data['corners'])
+        for i, (x, y) in enumerate(data['corners']):
+            # Transform: (x, y) -> (y, w - x) for 90° CCW rotation
+            new_corners[i] = [y, w - x]
+
+        data['corners'] = new_corners
+        data['original_corners'] = new_corners.copy()
+
+        self.display_preview()
+        self.log(f"Rotated image {self.current_preview_index + 1} counter-clockwise")
+
+    def add_manual_image(self):
+        """Add manual image with full flatbed as default"""
+        if self.full_scan_image is None:
+            messagebox.showwarning("No Scan", "Please perform a scan first")
+            return
+
+        # Create default corners for full image
+        h, w = self.full_scan_image.shape[:2]
+        corners = np.array([
+            [0, 0],
+            [w - 1, 0],
+            [w - 1, h - 1],
+            [0, h - 1]
+        ], dtype=np.float32)
+
+        # Add to cropped images
+        self.cropped_images.append({
+            'image': self.full_scan_image.copy(),
+            'corners': corners,
+            'original_corners': corners.copy()
+        })
+
+        # Navigate to the new image
+        self.current_preview_index = len(self.cropped_images) - 1
+        self.display_preview()
+        self.update_navigation_buttons()
+        self.log(f"Added manual image (full flatbed) - Total: {len(self.cropped_images)} images")
+
+    def remove_current_image(self):
+        """Remove the current image from the list"""
+        if not self.cropped_images:
+            return
+
+        if messagebox.askyesno("Remove Image",
+                               f"Remove image {self.current_preview_index + 1} from the list?"):
+            self.cropped_images.pop(self.current_preview_index)
+            self.log(f"Removed image - Remaining: {len(self.cropped_images)} images")
+
+            if self.cropped_images:
+                # Adjust index if needed
+                if self.current_preview_index >= len(self.cropped_images):
+                    self.current_preview_index = len(self.cropped_images) - 1
+                self.display_preview()
+                self.update_navigation_buttons()
+            else:
+                # No images left
+                self.canvas.delete("all")
+                self.image_label.config(text="No images")
+                self.reset_preview()
+
     def display_preview(self):
         """Display current cropped image"""
         if not self.cropped_images:
@@ -658,13 +915,23 @@ class ScannerGUI:
 
     def enable_preview_controls(self):
         """Enable preview control buttons"""
+        self.update_navigation_buttons()
+        self.rotate_cw_btn.config(state='normal')
+        self.rotate_ccw_btn.config(state='normal')
+        self.adjust_btn.config(state='normal')
+        self.add_btn.config(state='normal')
+        self.remove_btn.config(state='normal')
+        self.keep_btn.config(state='normal')
+        self.rescan_btn.config(state='normal')
+
+    def update_navigation_buttons(self):
+        """Update navigation button states"""
         if len(self.cropped_images) > 1:
             self.prev_btn.config(state='normal')
             self.next_btn.config(state='normal')
-
-        self.adjust_btn.config(state='normal')
-        self.keep_btn.config(state='normal')
-        self.rescan_btn.config(state='normal')
+        else:
+            self.prev_btn.config(state='disabled')
+            self.next_btn.config(state='disabled')
 
     def prev_image(self):
         """Show previous image"""
@@ -681,13 +948,37 @@ class ScannerGUI:
     def keep_images(self):
         """Save all cropped images"""
         if not self.cropped_images:
+            messagebox.showwarning("No Images", "No images to save")
             return
 
         try:
             output_folder = self.settings.get("output_folder", "Scans")
+            if not os.path.exists(output_folder):
+                os.makedirs(output_folder)
+
             date_str = datetime.now().strftime("%Y.%m.%d")
             doc_name = self.doc_name_var.get()
             jpg_quality = self.jpg_quality_var.get()
+
+            # Get EXIF settings
+            exif_date = self.exif_date_var.get().strip()
+            exif_title = self.exif_title_var.get().strip()
+
+            # Validate EXIF date format if provided
+            exif_datetime = None
+            if exif_date:
+                try:
+                    # Parse and validate date
+                    parts = exif_date.split(':')
+                    if len(parts) != 3:
+                        raise ValueError("Invalid date format")
+                    year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+                    # Set time to 12:00:00 AM (00:00:00)
+                    exif_datetime = f"{year:04d}:{month:02d}:{day:02d} 00:00:00"
+                except:
+                    messagebox.showerror("Invalid Date",
+                                         "EXIF date must be in format YYYY:MM:DD (e.g., 2024:12:25)")
+                    return
 
             # Find next available document number
             doc_counter = 1
@@ -699,6 +990,7 @@ class ScannerGUI:
                 doc_counter += 1
 
             # Save each image
+            saved_files = []
             for idx, data in enumerate(self.cropped_images):
                 image = data['image']
                 corners = data['corners']
@@ -715,7 +1007,36 @@ class ScannerGUI:
                 output_filename = f"{date_str} {doc_name}{doc_counter + idx}.jpg"
                 output_path = os.path.join(output_folder, output_filename)
                 cv2.imwrite(output_path, warped, [cv2.IMWRITE_JPEG_QUALITY, jpg_quality])
+                saved_files.append(output_path)
                 self.log(f"Saved: {output_path}")
+
+            # Apply EXIF metadata if specified
+            if (exif_datetime or exif_title) and os.path.exists(EXIFTOOL_PATH):
+                self.log("Applying EXIF metadata...")
+                for filepath in saved_files:
+                    try:
+                        cmd = [EXIFTOOL_PATH, "-overwrite_original"]
+
+                        if exif_datetime:
+                            cmd.extend([f"-DateTimeOriginal={exif_datetime}",
+                                        f"-CreateDate={exif_datetime}",
+                                        f"-ModifyDate={exif_datetime}"])
+
+                        if exif_title:
+                            cmd.extend([f"-Title={exif_title}",
+                                        f"-XPTitle={exif_title}"])
+
+                        cmd.append(filepath)
+
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        if result.returncode == 0:
+                            self.log(f"  EXIF applied to {os.path.basename(filepath)}")
+                        else:
+                            self.log(f"  Warning: EXIF failed for {os.path.basename(filepath)}")
+                    except Exception as e:
+                        self.log(f"  Warning: Could not apply EXIF to {os.path.basename(filepath)}: {e}")
+            elif (exif_datetime or exif_title) and not os.path.exists(EXIFTOOL_PATH):
+                self.log(f"Warning: exiftool not found at {EXIFTOOL_PATH}")
 
             messagebox.showinfo("Success", f"Saved {len(self.cropped_images)} image(s)")
             self.reset_preview()
@@ -733,11 +1054,16 @@ class ScannerGUI:
         """Reset preview state"""
         self.cropped_images = []
         self.current_preview_index = 0
+        self.full_scan_image = None
         self.canvas.delete("all")
         self.image_label.config(text="No images")
         self.prev_btn.config(state='disabled')
         self.next_btn.config(state='disabled')
+        self.rotate_cw_btn.config(state='disabled')
+        self.rotate_ccw_btn.config(state='disabled')
         self.adjust_btn.config(state='disabled')
+        self.add_btn.config(state='disabled')
+        self.remove_btn.config(state='disabled')
         self.keep_btn.config(state='disabled')
         self.rescan_btn.config(state='disabled')
 
