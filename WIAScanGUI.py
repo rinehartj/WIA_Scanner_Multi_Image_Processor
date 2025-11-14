@@ -2,6 +2,7 @@ import win32com.client
 import pythoncom
 from datetime import datetime
 import os
+import sys
 import cv2
 import numpy as np
 import tkinter as tk
@@ -11,9 +12,21 @@ import json
 import threading
 import subprocess
 
-# Settings file for persistence
-SETTINGS_FILE = "scanner_settings.json"
-EXIFTOOL_PATH = "tools/exiftool.exe"
+# Get the correct path for bundled resources
+if getattr(sys, 'frozen', False):
+    # Running as compiled executable
+    BASE_DIR = sys._MEIPASS
+else:
+    # Running as script
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Settings file for persistence (in user directory, not in _MEIPASS)
+if getattr(sys, 'frozen', False):
+    SETTINGS_FILE = os.path.join(os.path.dirname(sys.executable), "scanner_settings.json")
+else:
+    SETTINGS_FILE = os.path.join(BASE_DIR, "scanner_settings.json")
+
+EXIFTOOL_PATH = os.path.join(BASE_DIR, "tools", "exiftool.exe")
 
 # WIA Constants
 WIA_INTENT_NONE = 0x00000000
@@ -562,8 +575,13 @@ class ScannerGUI:
             else:
                 # Save temporary TIFF for processing in script directory
                 self.log("Creating temporary file for processing...")
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                self.tiff_filepath = os.path.join(script_dir, "temp_scan.tif")
+                if getattr(sys, 'frozen', False):
+                    # When frozen, use executable directory
+                    temp_dir = os.path.dirname(sys.executable)
+                else:
+                    # When running as script
+                    temp_dir = os.path.dirname(os.path.abspath(__file__))
+                self.tiff_filepath = os.path.join(temp_dir, "temp_scan.tif")
                 image.SaveFile(self.tiff_filepath)
 
             # Store full scan image for manual add
