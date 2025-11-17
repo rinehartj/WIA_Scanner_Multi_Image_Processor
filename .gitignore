@@ -1,4 +1,5 @@
 tools/
 dist/
 build/
+.idea/
 scanner_settings.json
