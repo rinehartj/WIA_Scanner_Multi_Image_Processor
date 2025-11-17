@@ -306,6 +306,7 @@ class ScannerGUI:
         self.cropped_images = []
         self.current_preview_index = 0
         self.full_scan_image = None  # Store full scan for manual add
+        self.image_exif_data = {}  # Store EXIF data per image {index: {"date": "", "title": ""}}
 
         # Load settings
         self.load_settings()
@@ -324,13 +325,19 @@ class ScannerGUI:
             "document_name": "Document",
             "output_folder": "Scans",
             "exif_date": "",
-            "exif_title": ""
+            "exif_title": "",
+            "white_balance_factors": None  # Will store [B, G, R] correction factors
         }
 
         try:
             if os.path.exists(SETTINGS_FILE):
                 with open(SETTINGS_FILE, 'r') as f:
                     self.settings = json.load(f)
+                # Don't load EXIF date/title from settings - they're per-image now
+                if "exif_date" in self.settings:
+                    del self.settings["exif_date"]
+                if "exif_title" in self.settings:
+                    del self.settings["exif_title"]
             else:
                 self.settings = default_settings
         except:
@@ -372,6 +379,18 @@ class ScannerGUI:
                                textvariable=self.dpi_var, width=10)
         dpi_spin.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
 
+        # Calibration button and status (right side of settings)
+        calibrate_btn = ttk.Button(settings_frame, text="Calibrate White Balance",
+                                   command=self.calibrate_scanner, underline=0)
+        calibrate_btn.grid(row=0, column=2, sticky=(tk.W, tk.E), padx=20, pady=5)
+        self.root.bind('<Alt-c>', lambda e: self.calibrate_scanner())
+
+        self.calibration_status = ttk.Label(settings_frame, text="",
+                                            font=('Arial', 8, 'italic'),
+                                            foreground='gray')
+        self.calibration_status.grid(row=1, column=2, padx=20, pady=(0, 5))
+        self.update_calibration_status()
+
         # Scan Distance
         ttk.Label(settings_frame, text="Scan Distance (inches):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
         self.distance_var = tk.DoubleVar(value=self.settings.get("scan_distance", 3.0))
@@ -396,54 +415,62 @@ class ScannerGUI:
         # Save TIFF checkbox
         self.save_tiff_var = tk.BooleanVar(value=self.settings.get("save_tiff", True))
         tiff_check = ttk.Checkbutton(settings_frame, text="Save TIFF file",
-                                     variable=self.save_tiff_var)
+                                     variable=self.save_tiff_var, underline=5)
         tiff_check.grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+        self.root.bind('<Alt-f>', lambda e: self.save_tiff_var.set(not self.save_tiff_var.get()))
+        self.root.bind('<Alt-F>', lambda e: self.save_tiff_var.set(not self.save_tiff_var.get()))
 
         # Document Name
-        ttk.Label(settings_frame, text="Document Name:").grid(row=5, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(settings_frame, text="Document Name:", underline=6).grid(row=5, column=0, sticky=tk.W, padx=5, pady=5)
         self.doc_name_var = tk.StringVar(value=self.settings.get("document_name", "Document"))
         doc_entry = ttk.Entry(settings_frame, textvariable=self.doc_name_var, width=20)
         doc_entry.grid(row=5, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        self.root.bind('<Alt-m>', lambda e: doc_entry.focus_set())
+        self.root.bind('<Alt-M>', lambda e: doc_entry.focus_set())
 
         # Output Folder
-        ttk.Label(settings_frame, text="Output Folder:").grid(row=6, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(settings_frame, text="Output Folder:", underline=0).grid(row=6, column=0, sticky=tk.W, padx=5, pady=5)
         folder_subframe = ttk.Frame(settings_frame)
-        folder_subframe.grid(row=6, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        folder_subframe.grid(row=6, column=1, columnspan=2, sticky=(tk.W, tk.E), padx=5, pady=5)
 
         self.folder_var = tk.StringVar(value=self.settings.get("output_folder", "Scans"))
-        folder_entry = ttk.Entry(folder_subframe, textvariable=self.folder_var, width=20)
+        folder_entry = ttk.Entry(folder_subframe, textvariable=self.folder_var, width=30)
         folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.root.bind('<Alt-o>', lambda e: folder_entry.focus_set())
+        self.root.bind('<Alt-O>', lambda e: folder_entry.focus_set())
 
-        browse_btn = ttk.Button(folder_subframe, text="...", command=self.browse_folder, width=3)
+        browse_btn = ttk.Button(folder_subframe, text="Browse...", command=self.browse_folder, underline=0)
         browse_btn.pack(side=tk.LEFT, padx=(5, 0))
+        self.root.bind('<Alt-b>', lambda e: self.browse_folder())
+        self.root.bind('<Alt-B>', lambda e: self.browse_folder())
 
         # EXIF Settings Frame
         exif_frame = ttk.LabelFrame(left_frame, text="EXIF Metadata (Optional)", padding="10")
         exif_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
 
-        # EXIF Date
-        ttk.Label(exif_frame, text="Date (YYYY:MM:DD):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.exif_date_var = tk.StringVar(value=self.settings.get("exif_date", ""))
+        # EXIF Date - per image
+        ttk.Label(exif_frame, text="EXIF Date (YYYY:MM:DD):", underline=5).grid(row=0, column=0, sticky=tk.W, padx=5,
+                                                                                pady=5)
+        self.exif_date_var = tk.StringVar(value="")
         exif_date_entry = ttk.Entry(exif_frame, textvariable=self.exif_date_var, width=20)
         exif_date_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        self.root.bind('<Alt-t>', lambda e: exif_date_entry.focus_set())
+        self.root.bind('<Alt-T>', lambda e: exif_date_entry.focus_set())
 
-        ttk.Label(exif_frame, text="(Leave blank for no date)",
+        ttk.Label(exif_frame, text="(Per image - set after scan)",
                   font=('Arial', 8, 'italic')).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=5)
 
-        # EXIF Title
-        ttk.Label(exif_frame, text="Title:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
-        self.exif_title_var = tk.StringVar(value=self.settings.get("exif_title", ""))
+        # EXIF Title - per image
+        ttk.Label(exif_frame, text="Title:", underline=1).grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        self.exif_title_var = tk.StringVar(value="")
         exif_title_entry = ttk.Entry(exif_frame, textvariable=self.exif_title_var, width=20)
         exif_title_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
-
-        # Scan Button
-        scan_btn = ttk.Button(left_frame, text="Scan", command=self.start_scan, width=20)
-        scan_btn.grid(row=2, column=0, pady=10)
+        self.root.bind('<Alt-i>', lambda e: exif_title_entry.focus_set())
 
         # Progress/Log Frame
         log_frame = ttk.LabelFrame(left_frame, text="Status", padding="10")
-        log_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        left_frame.rowconfigure(3, weight=1)
+        log_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        left_frame.rowconfigure(2, weight=1)
 
         self.log_text = scrolledtext.ScrolledText(log_frame, height=10, width=50, state='disabled')
         self.log_text.pack(fill=tk.BOTH, expand=True)
@@ -458,45 +485,65 @@ class ScannerGUI:
 
         # Navigation and action buttons at bottom
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=4, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=10)
 
-        self.prev_btn = ttk.Button(button_frame, text="← Previous", command=self.prev_image, state='disabled')
+        # Scan button on the left
+        self.scan_btn = ttk.Button(button_frame, text="Scan", command=self.start_scan,
+                                   width=10, underline=0)
+        self.scan_btn.pack(side=tk.LEFT, padx=5)
+
+        # Spacer
+        ttk.Frame(button_frame, width=20).pack(side=tk.LEFT)
+
+        self.prev_btn = ttk.Button(button_frame, text="Previous", command=self.prev_image,
+                                   state='disabled', underline=0)
         self.prev_btn.pack(side=tk.LEFT, padx=5)
 
         self.image_label = ttk.Label(button_frame, text="No images")
         self.image_label.pack(side=tk.LEFT, padx=20)
 
-        self.next_btn = ttk.Button(button_frame, text="Next →", command=self.next_image, state='disabled')
+        self.next_btn = ttk.Button(button_frame, text="Next", command=self.next_image,
+                                   state='disabled', underline=0)
         self.next_btn.pack(side=tk.LEFT, padx=5)
 
         # Rotation buttons
         self.rotate_ccw_btn = ttk.Button(button_frame, text="↶ Rotate CCW",
-                                         command=self.rotate_ccw, state='disabled')
+                                         command=self.rotate_ccw, state='disabled',
+                                         width=13, underline=9)
         self.rotate_ccw_btn.pack(side=tk.LEFT, padx=5)
 
         self.rotate_cw_btn = ttk.Button(button_frame, text="↷ Rotate CW",
-                                        command=self.rotate_cw, state='disabled')
+                                        command=self.rotate_cw, state='disabled',
+                                        width=13, underline=10)
         self.rotate_cw_btn.pack(side=tk.LEFT, padx=5)
 
         self.adjust_btn = ttk.Button(button_frame, text="Adjust Corners",
-                                     command=self.open_adjustment_window, state='disabled')
-        self.adjust_btn.pack(side=tk.LEFT, padx=20)
+                                     command=self.open_adjustment_window, state='disabled',
+                                     width=15, underline=7)
+        self.adjust_btn.pack(side=tk.LEFT, padx=5)
 
         self.add_btn = ttk.Button(button_frame, text="Add Image",
-                                  command=self.add_manual_image, state='disabled')
+                                  command=self.add_manual_image, state='disabled',
+                                  width=12, underline=4)
         self.add_btn.pack(side=tk.LEFT, padx=5)
 
         self.remove_btn = ttk.Button(button_frame, text="Remove Image",
-                                     command=self.remove_current_image, state='disabled')
+                                     command=self.remove_current_image, state='disabled',
+                                     width=13, underline=0)
         self.remove_btn.pack(side=tk.LEFT, padx=5)
 
         self.keep_btn = ttk.Button(button_frame, text="Keep All",
-                                   command=self.keep_images, state='disabled')
+                                   command=self.keep_images, state='disabled',
+                                   width=10, underline=0)
         self.keep_btn.pack(side=tk.LEFT, padx=5)
 
         self.rescan_btn = ttk.Button(button_frame, text="Rescan",
-                                     command=self.rescan, state='disabled')
+                                     command=self.rescan, state='disabled',
+                                     width=10, underline=2)
         self.rescan_btn.pack(side=tk.LEFT, padx=5)
+
+        # Bind all keyboard shortcuts AFTER creating all widgets
+        self.setup_keyboard_shortcuts()
 
     def browse_folder(self):
         """Browse for output folder"""
@@ -506,6 +553,180 @@ class ScannerGUI:
             self.folder_var.set(folder)
             self.settings["output_folder"] = folder
             self.save_settings()
+
+    def update_calibration_status(self):
+        """Update the calibration status label"""
+        if self.settings.get("white_balance_factors"):
+            self.calibration_status.config(text="✓ White balance calibrated",
+                                           foreground='green')
+        else:
+            self.calibration_status.config(text="⚠ Not calibrated",
+                                           foreground='orange')
+
+    def setup_keyboard_shortcuts(self):
+        """Setup all keyboard shortcuts"""
+        # Settings and fields
+        self.root.bind('<Alt-c>', lambda e: self.calibrate_scanner())
+        self.root.bind('<Alt-C>', lambda e: self.calibrate_scanner())
+        self.root.bind('<Alt-f>', lambda e: self.save_tiff_var.set(not self.save_tiff_var.get()))
+        self.root.bind('<Alt-F>', lambda e: self.save_tiff_var.set(not self.save_tiff_var.get()))
+        self.root.bind('<Alt-m>', lambda e: self.root.focus_get() and self.root.nametowidget(
+            self.root.focus_get()).focus_set() if hasattr(self.root.focus_get(), 'focus_set') else None)
+        self.root.bind('<Alt-M>', lambda e: self.root.focus_get() and self.root.nametowidget(
+            self.root.focus_get()).focus_set() if hasattr(self.root.focus_get(), 'focus_set') else None)
+        self.root.bind('<Alt-b>', lambda e: self.browse_folder())
+        self.root.bind('<Alt-B>', lambda e: self.browse_folder())
+
+        # Bottom buttons
+        self.root.bind('<Alt-s>', lambda e: self.start_scan())
+        self.root.bind('<Alt-S>', lambda e: self.start_scan())
+        self.root.bind('<Alt-p>', lambda e: self.prev_image() if str(self.prev_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-P>', lambda e: self.prev_image() if str(self.prev_btn['state']) == 'normal' else None)
+        self.root.bind('<Left>', lambda e: self.prev_image() if str(self.prev_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-n>', lambda e: self.next_image() if str(self.next_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-N>', lambda e: self.next_image() if str(self.next_btn['state']) == 'normal' else None)
+        self.root.bind('<Right>', lambda e: self.next_image() if str(self.next_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-c>',
+                       lambda e: self.rotate_ccw() if str(self.rotate_ccw_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-C>',
+                       lambda e: self.rotate_ccw() if str(self.rotate_ccw_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-w>', lambda e: self.rotate_cw() if str(self.rotate_cw_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-W>', lambda e: self.rotate_cw() if str(self.rotate_cw_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-o>',
+                       lambda e: self.open_adjustment_window() if str(self.adjust_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-O>',
+                       lambda e: self.open_adjustment_window() if str(self.adjust_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-i>', lambda e: self.add_manual_image() if str(self.add_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-I>', lambda e: self.add_manual_image() if str(self.add_btn['state']) == 'normal' else None)
+        self.root.bind('<Insert>',
+                       lambda e: self.add_manual_image() if str(self.add_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-r>',
+                       lambda e: self.remove_current_image() if str(self.remove_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-R>',
+                       lambda e: self.remove_current_image() if str(self.remove_btn['state']) == 'normal' else None)
+        self.root.bind('<Delete>',
+                       lambda e: self.remove_current_image() if str(self.remove_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-k>', lambda e: self.keep_images() if str(self.keep_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-K>', lambda e: self.keep_images() if str(self.keep_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-e>', lambda e: self.rescan() if str(self.rescan_btn['state']) == 'normal' else None)
+        self.root.bind('<Alt-E>', lambda e: self.rescan() if str(self.rescan_btn['state']) == 'normal' else None)
+
+    def calibrate_scanner(self):
+        """Perform calibration scan for white balance"""
+        result = messagebox.askokcancel(
+            "Scanner Calibration",
+            "This will scan the empty scanner bed to calibrate white balance.\n\n"
+            "Please:\n"
+            "1. Remove all documents from the scanner\n"
+            "2. Close the scanner lid\n"
+            "3. Click OK to start calibration scan"
+        )
+
+        if not result:
+            return
+
+        # Start calibration in thread
+        thread = threading.Thread(target=self.calibration_thread)
+        thread.daemon = True
+        thread.start()
+
+    def calibration_thread(self):
+        """Calibration scan operation in separate thread"""
+        try:
+            # Initialize COM for this thread
+            pythoncom.CoInitialize()
+
+            self.log("Starting calibration scan...")
+            self.scanner = self.setup_scanner()
+
+            if self.scanner is None:
+                self.log("ERROR: Failed to initialize scanner")
+                pythoncom.CoUninitialize()
+                return
+
+            # Perform calibration scan
+            image = self.scan_document(self.scanner)
+
+            if image is None:
+                self.log("ERROR: Calibration scan failed")
+                pythoncom.CoUninitialize()
+                return
+
+            # Save temporary file
+            if getattr(sys, 'frozen', False):
+                temp_dir = os.path.dirname(sys.executable)
+            else:
+                temp_dir = os.path.dirname(os.path.abspath(__file__))
+
+            cal_filepath = os.path.join(temp_dir, "calibration_scan.tif")
+            image.SaveFile(cal_filepath)
+
+            # Load and analyze the calibration image
+            cal_image = cv2.imread(cal_filepath)
+
+            if cal_image is None:
+                self.log("ERROR: Could not load calibration image")
+                pythoncom.CoUninitialize()
+                return
+
+            # Calculate white balance from the calibration scan
+            self.log("Analyzing calibration image...")
+
+            # Sample center area (avoid edges which might have shadows)
+            h, w = cal_image.shape[:2]
+            center_h_start = h // 4
+            center_h_end = 3 * h // 4
+            center_w_start = w // 4
+            center_w_end = 3 * w // 4
+
+            center_area = cal_image[center_h_start:center_h_end, center_w_start:center_w_end]
+
+            # Get average color of the scanner bed
+            avg_color = cv2.mean(center_area)[:3]  # [B, G, R]
+
+            # Calculate correction factors to make it pure white (255, 255, 255)
+            target_white = 255.0
+            factors = [target_white / (avg_color[i] + 1) for i in range(3)]
+
+            # Store calibration data
+            self.settings["white_balance_factors"] = factors
+            self.save_settings()
+
+            # Clean up temp file
+            if os.path.exists(cal_filepath):
+                os.remove(cal_filepath)
+
+            self.log(f"Calibration complete! Factors: B={factors[0]:.3f}, G={factors[1]:.3f}, R={factors[2]:.3f}")
+            self.root.after(0, self.update_calibration_status)
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Calibration Complete",
+                "White balance calibration successful!\n"
+                "All future scans will be color-corrected."
+            ))
+
+            pythoncom.CoUninitialize()
+
+        except Exception as e:
+            self.log(f"ERROR during calibration: {str(e)}")
+            try:
+                pythoncom.CoUninitialize()
+            except:
+                pass
+
+    def apply_white_balance(self, image):
+        """Apply white balance correction to image"""
+        factors = self.settings.get("white_balance_factors")
+
+        if factors is None:
+            return image  # No calibration, return original
+
+        # Apply correction factors
+        corrected = image.astype(np.float32)
+        corrected[:, :, 0] *= factors[0]  # Blue
+        corrected[:, :, 1] *= factors[1]  # Green
+        corrected[:, :, 2] *= factors[2]  # Red
+
+        return np.clip(corrected, 0, 255).astype(np.uint8)
 
     def log(self, message):
         """Add message to log"""
@@ -525,8 +746,6 @@ class ScannerGUI:
         self.settings["save_tiff"] = self.save_tiff_var.get()
         self.settings["document_name"] = self.doc_name_var.get()
         self.settings["output_folder"] = self.folder_var.get()
-        self.settings["exif_date"] = self.exif_date_var.get()
-        self.settings["exif_title"] = self.exif_title_var.get()
         self.save_settings()
 
         # Clear log and preview
@@ -534,6 +753,11 @@ class ScannerGUI:
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state='disabled')
         self.canvas.delete("all")
+
+        # Clear EXIF fields and data
+        self.exif_date_var.set("")
+        self.exif_title_var.set("")
+        self.image_exif_data = {}
 
         # Start scan in thread
         thread = threading.Thread(target=self.scan_thread)
@@ -649,11 +873,11 @@ class ScannerGUI:
             self.set_property_by_id(item, 6148, dpi, "Vertical Resolution")
             self.set_property_by_id(item, 6146, WIA_INTENT_IMAGE_TYPE_COLOR, "Color Mode")
 
-            # Set scan area based on distance
+            # Set scan area based on distance (Y only, X is full width)
             distance = self.distance_var.get()
-            extent = int(distance * dpi)
-            self.set_property_by_id(item, 6151, extent, "X Extent")
-            self.set_property_by_id(item, 6152, extent, "Y Extent")
+            y_extent = int(distance * dpi)
+            self.set_property_by_id(item, 6152, y_extent, "Y Extent")
+            # Don't set X Extent - let it use the scanner's full width
 
             # Perform scan
             image = item.Transfer("{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}")
@@ -747,15 +971,19 @@ class ScannerGUI:
 
         data = self.cropped_images[self.current_preview_index]
 
+        # Get original image dimensions
+        old_h, old_w = data['image'].shape[:2]
+
         # Rotate image 90 degrees clockwise
         data['image'] = cv2.rotate(data['image'], cv2.ROTATE_90_CLOCKWISE)
 
-        # Rotate corners
-        h, w = data['image'].shape[:2]
+        # Get new image dimensions
+        new_h, new_w = data['image'].shape[:2]
+
+        # Rotate corners: (x, y) -> (old_h - 1 - y, x)
         new_corners = np.zeros_like(data['corners'])
         for i, (x, y) in enumerate(data['corners']):
-            # Transform: (x, y) -> (h - y, x) for 90° CW rotation
-            new_corners[i] = [h - y, x]
+            new_corners[i] = [old_h - 1 - y, x]
 
         data['corners'] = new_corners
         data['original_corners'] = new_corners.copy()
@@ -770,15 +998,19 @@ class ScannerGUI:
 
         data = self.cropped_images[self.current_preview_index]
 
+        # Get original image dimensions
+        old_h, old_w = data['image'].shape[:2]
+
         # Rotate image 90 degrees counter-clockwise
         data['image'] = cv2.rotate(data['image'], cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-        # Rotate corners
-        h, w = data['image'].shape[:2]
+        # Get new image dimensions
+        new_h, new_w = data['image'].shape[:2]
+
+        # Rotate corners: (x, y) -> (y, old_w - 1 - x)
         new_corners = np.zeros_like(data['corners'])
         for i, (x, y) in enumerate(data['corners']):
-            # Transform: (x, y) -> (y, w - x) for 90° CCW rotation
-            new_corners[i] = [y, w - x]
+            new_corners[i] = [y, old_w - 1 - x]
 
         data['corners'] = new_corners
         data['original_corners'] = new_corners.copy()
@@ -844,6 +1076,15 @@ class ScannerGUI:
         data = self.cropped_images[self.current_preview_index]
         image = data['image']
         corners = data['corners']
+
+        # Load EXIF data for this image
+        idx = self.current_preview_index
+        if idx in self.image_exif_data:
+            self.exif_date_var.set(self.image_exif_data[idx].get("date", ""))
+            self.exif_title_var.set(self.image_exif_data[idx].get("title", ""))
+        else:
+            self.exif_date_var.set("")
+            self.exif_title_var.set("")
 
         # Apply transform
         warped = self.four_point_transform(image, corners)
@@ -954,20 +1195,35 @@ class ScannerGUI:
     def prev_image(self):
         """Show previous image"""
         if self.current_preview_index > 0:
+            # Save current EXIF data before switching
+            self.save_current_exif_data()
             self.current_preview_index -= 1
             self.display_preview()
 
     def next_image(self):
         """Show next image"""
         if self.current_preview_index < len(self.cropped_images) - 1:
+            # Save current EXIF data before switching
+            self.save_current_exif_data()
             self.current_preview_index += 1
             self.display_preview()
+
+    def save_current_exif_data(self):
+        """Save EXIF data from fields for current image"""
+        idx = self.current_preview_index
+        self.image_exif_data[idx] = {
+            "date": self.exif_date_var.get().strip(),
+            "title": self.exif_title_var.get().strip()
+        }
 
     def keep_images(self):
         """Save all cropped images"""
         if not self.cropped_images:
             messagebox.showwarning("No Images", "No images to save")
             return
+
+        # Save current EXIF data before processing
+        self.save_current_exif_data()
 
         try:
             output_folder = self.settings.get("output_folder", "Scans")
@@ -977,26 +1233,6 @@ class ScannerGUI:
             date_str = datetime.now().strftime("%Y.%m.%d")
             doc_name = self.doc_name_var.get()
             jpg_quality = self.jpg_quality_var.get()
-
-            # Get EXIF settings
-            exif_date = self.exif_date_var.get().strip()
-            exif_title = self.exif_title_var.get().strip()
-
-            # Validate EXIF date format if provided
-            exif_datetime = None
-            if exif_date:
-                try:
-                    # Parse and validate date
-                    parts = exif_date.split(':')
-                    if len(parts) != 3:
-                        raise ValueError("Invalid date format")
-                    year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
-                    # Set time to 12:00:00 AM (00:00:00)
-                    exif_datetime = f"{year:04d}:{month:02d}:{day:02d} 00:00:00"
-                except:
-                    messagebox.showerror("Invalid Date",
-                                         "EXIF date must be in format YYYY:MM:DD (e.g., 2024:12:25)")
-                    return
 
             # Find next available document number
             doc_counter = 1
@@ -1013,6 +1249,27 @@ class ScannerGUI:
                 image = data['image']
                 corners = data['corners']
 
+                # Get EXIF data for this image
+                exif_data = self.image_exif_data.get(idx, {"date": "", "title": ""})
+                exif_date = exif_data.get("date", "").strip()
+                exif_title = exif_data.get("title", "").strip()
+
+                # Validate EXIF date format if provided
+                exif_datetime = None
+                if exif_date:
+                    try:
+                        # Parse and validate date
+                        parts = exif_date.split(':')
+                        if len(parts) != 3:
+                            raise ValueError("Invalid date format")
+                        year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+                        # Set time to 12:00:00 AM (00:00:00)
+                        exif_datetime = f"{year:04d}:{month:02d}:{day:02d} 00:00:00"
+                    except:
+                        messagebox.showerror("Invalid Date",
+                                             f"EXIF date for image {idx + 1} must be in format YYYY:MM:DD (e.g., 2024:12:25)")
+                        return
+
                 # Apply transform and crop
                 warped = self.four_point_transform(image, corners)
                 crop_px = self.crop_pixels_var.get()
@@ -1021,40 +1278,41 @@ class ScannerGUI:
                     if h > 2 * crop_px and w > 2 * crop_px:
                         warped = warped[crop_px:h - crop_px, crop_px:w - crop_px]
 
+                # Apply white balance correction
+                warped = self.apply_white_balance(warped)
+
                 # Save
                 output_filename = f"{date_str} {doc_name}{doc_counter + idx}.jpg"
                 output_path = os.path.join(output_folder, output_filename)
                 cv2.imwrite(output_path, warped, [cv2.IMWRITE_JPEG_QUALITY, jpg_quality])
-                saved_files.append(output_path)
+                saved_files.append((output_path, exif_datetime, exif_title))
                 self.log(f"Saved: {output_path}")
 
             # Apply EXIF metadata if specified
-            if (exif_datetime or exif_title) and os.path.exists(EXIFTOOL_PATH):
-                self.log("Applying EXIF metadata...")
-                for filepath in saved_files:
-                    try:
-                        cmd = [EXIFTOOL_PATH, "-overwrite_original"]
+            if os.path.exists(EXIFTOOL_PATH):
+                for filepath, exif_datetime, exif_title in saved_files:
+                    if exif_datetime or exif_title:
+                        try:
+                            cmd = [EXIFTOOL_PATH, "-overwrite_original"]
 
-                        if exif_datetime:
-                            cmd.extend([f"-DateTimeOriginal={exif_datetime}",
-                                        f"-CreateDate={exif_datetime}",
-                                        f"-ModifyDate={exif_datetime}"])
+                            if exif_datetime:
+                                cmd.extend([f"-DateTimeOriginal={exif_datetime}",
+                                            f"-CreateDate={exif_datetime}",
+                                            f"-ModifyDate={exif_datetime}"])
 
-                        if exif_title:
-                            cmd.extend([f"-Title={exif_title}",
-                                        f"-XPTitle={exif_title}"])
+                            if exif_title:
+                                cmd.extend([f"-Title={exif_title}",
+                                            f"-XPTitle={exif_title}"])
 
-                        cmd.append(filepath)
+                            cmd.append(filepath)
 
-                        result = subprocess.run(cmd, capture_output=True, text=True)
-                        if result.returncode == 0:
-                            self.log(f"  EXIF applied to {os.path.basename(filepath)}")
-                        else:
-                            self.log(f"  Warning: EXIF failed for {os.path.basename(filepath)}")
-                    except Exception as e:
-                        self.log(f"  Warning: Could not apply EXIF to {os.path.basename(filepath)}: {e}")
-            elif (exif_datetime or exif_title) and not os.path.exists(EXIFTOOL_PATH):
-                self.log(f"Warning: exiftool not found at {EXIFTOOL_PATH}")
+                            result = subprocess.run(cmd, capture_output=True, text=True)
+                            if result.returncode == 0:
+                                self.log(f"  EXIF applied to {os.path.basename(filepath)}")
+                            else:
+                                self.log(f"  Warning: EXIF failed for {os.path.basename(filepath)}")
+                        except Exception as e:
+                            self.log(f"  Warning: Could not apply EXIF to {os.path.basename(filepath)}: {e}")
 
             messagebox.showinfo("Success", f"Saved {len(self.cropped_images)} image(s)")
             self.reset_preview()
@@ -1073,6 +1331,9 @@ class ScannerGUI:
         self.cropped_images = []
         self.current_preview_index = 0
         self.full_scan_image = None
+        self.image_exif_data = {}
+        self.exif_date_var.set("")
+        self.exif_title_var.set("")
         self.canvas.delete("all")
         self.image_label.config(text="No images")
         self.prev_btn.config(state='disabled')
