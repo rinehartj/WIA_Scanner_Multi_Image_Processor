@@ -1,4 +1,4 @@
-# WIAScannerGUI
+# WIAScanGUI
 
 **This graphical program helps legacy flatbed scanners be supported on Windows 11 and later. The program utilizes Windows Image Acquisition (WIA) to interface with scanners. This program is primarily intended to scan photos to a local directory without needing to crop, rotate, adjust EXIF data, or color correct the images afterward. The program allows you to do all of this, with some automated features.**
 
